@@ -80,120 +80,163 @@ function updateStatus(msg) {
     if (el) el.innerHTML = msg; // リンクを表示可能にするためHTMLとして設定
 }
 
-// Text-to-Speech
+// WAV Header Generator for Gemini PCM
+function createWavHeader(dataLength, sampleRate, numChannels, bitsPerSample) {
+    const blockAlign = (numChannels * bitsPerSample) / 8;
+    const byteRate = sampleRate * blockAlign;
+    const buffer = new ArrayBuffer(44);
+    const view = new DataView(buffer);
+    view.setUint8(0, 82); view.setUint8(1, 73); view.setUint8(2, 70); view.setUint8(3, 70); // RIFF
+    view.setUint32(4, 36 + dataLength, true);
+    view.setUint8(8, 87); view.setUint8(9, 65); view.setUint8(10, 86); view.setUint8(11, 69); // WAVE
+    view.setUint8(12, 102); view.setUint8(13, 109); view.setUint8(14, 116); view.setUint8(15, 32); // fmt 
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitsPerSample, true);
+    view.setUint8(36, 100); view.setUint8(37, 97); view.setUint8(38, 116); view.setUint8(39, 97); // data
+    view.setUint32(40, dataLength, true);
+    return new Uint8Array(buffer);
+}
+
+// Base64 PCM -> WAV ArrayBuffer
+function base64ToWavArrayBuffer(base64, sampleRate = 24000) {
+    const binaryString = atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    // Gemini usually returns 24kHz mono 16-bit PCM
+    const header = createWavHeader(len, sampleRate, 1, 16);
+    const wav = new Uint8Array(header.length + len);
+    wav.set(header);
+    wav.set(bytes, header.length);
+    return wav.buffer;
+}
+
+// Text-to-Speech via Gemini API (Free Tier Compatible)
 async function fetchGoogleTTS(text, rate) {
     const apiKey = STATE.googleApiKey.trim();
     if (!apiKey) return null;
 
-    updateStatus("Connecting to Google Cloud...");
+    updateStatus("Connecting to Gemini AI...");
 
-    // APIキーをURLパラメータではなくヘッダーで送る方式に変更（トラブル回避のため）
-    const url = `https://texttospeech.googleapis.com/v1/text:synthesize`;
+    // Gemini 2.0 Flash Exp (Audio capability)
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
 
     const body = {
-        input: { text: text },
-        voice: { languageCode: "en-US", name: "en-US-Neural2-F" },
-        audioConfig: { audioEncoding: "MP3", speakingRate: rate }
+        contents: [{ parts: [{ text: text }] }],
+        generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+                voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: "Aoede" }
+                }
+            }
+        }
     };
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
 
     try {
         const response = await fetch(url, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Goog-Api-Key': apiKey // ヘッダー認証に変更
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
             signal: controller.signal
         });
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-            // 詳細なエラーチェックやリンク表示は廃止し、即座にフォールバックさせる
-            // ユーザーが「他のアプリで動く」と言う場合、他アプリはエラーを無視して
-            // 標準音声にフォールバックしている可能性が高いため、それに合わせる
-            console.warn("Google TTS API Response not OK. Status:", response.status);
-            updateStatus("API unavailable. Using Standard Voice.");
+            console.warn("Gemini API Status:", response.status);
+            updateStatus("API unavailable (Gemini). Use Fallback.");
             return null;
         }
 
         const data = await response.json();
-        if (data.error) {
-            console.warn("Google TTS API Error Data:", data.error);
-            updateStatus("API Error. Using Standard Voice.");
+        const base64Audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+        if (!base64Audio) {
+            updateStatus("No audio data. Use Fallback.");
             return null;
         }
-        return data.audioContent;
+        return base64Audio; // Raw PCM Base64
+
     } catch (e) {
         clearTimeout(timeoutId);
         console.error("Fetch Exception:", e);
-        // タイムアウトやネットワークエラー時も静かにフォールバック
-        updateStatus("Connection issue. Using Standard Voice.");
+        updateStatus("Connection issue. Use Fallback.");
         return null;
     }
 }
 
-// Base64 -> ArrayBuffer変換
-function base64ToArrayBuffer(base64) {
-    const binaryX = atob(base64);
-    const len = binaryX.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryX.charCodeAt(i);
-    }
-    return bytes.buffer;
-}
+
 
 function speakOne(item, onEnd) {
     if (STATE.googleApiKey) {
-        updateStatus("Requesting Google Voice...");
+        updateStatus("Requesting Gemini Voice...");
         fetchGoogleTTS(item.text, item.rate)
-            .then(async (audioContent) => {
-                // AudioContext優先
+            .then(async (audioContent) => { // audioContent is PCM Base64
+                // 1. AudioContext Playback (Primary)
                 if (audioContent && STATE.audioContext) {
-                    updateStatus("Decoding via AudioContext...");
+                    updateStatus("Decoding Gemini Audio...");
                     try {
-                        const arrayBuffer = base64ToArrayBuffer(audioContent);
-                        const audioBuffer = await STATE.audioContext.decodeAudioData(arrayBuffer);
+                        const wavBuffer = base64ToWavArrayBuffer(audioContent, 24000); // Wrap PCM with WAV header
+                        const audioBuffer = await STATE.audioContext.decodeAudioData(wavBuffer);
 
                         const source = STATE.audioContext.createBufferSource();
                         source.buffer = audioBuffer;
+                        // Gemini doesn't support server-side rate yet, so we do it client-side
+                        source.playbackRate.value = item.rate;
+
                         source.connect(STATE.audioContext.destination);
 
                         source.onended = () => {
-                            updateStatus("Finished (AudioContext)");
+                            updateStatus("Finished (Gemini)");
                             onEnd();
                         };
 
                         source.start(0);
-                        updateStatus("Playing (AudioContext)");
+                        updateStatus("Playing (Gemini API)");
                     } catch (decodeErr) {
                         console.error("Decode Error:", decodeErr);
                         updateStatus("Decode Failed. Fallback.");
                         fallbackSpeak(item, onEnd);
                     }
                 }
-                // Contextがない場合の古いフォールバック
+                // 2. Generic Audio Element Fallback (Secondary)
                 else if (audioContent) {
-                    updateStatus("Fallback to generic Audio element...");
-                    const audio = new Audio("data:audio/mp3;base64," + audioContent);
+                    updateStatus("Fallback to Audio Element...");
+                    // Create Blob from WAV buffer
+                    const wavBuffer = base64ToWavArrayBuffer(audioContent, 24000);
+                    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+                    const url = URL.createObjectURL(blob);
+
+                    const audio = new Audio(url);
+                    audio.playbackRate = item.rate; // Client-side speed
+
                     audio.onended = () => {
-                        updateStatus("Finished (Google)");
+                        updateStatus("Finished (Gemini)");
+                        URL.revokeObjectURL(url);
                         onEnd();
                     };
                     audio.onerror = (e) => {
-                        updateStatus("Audio Decode Error. Fallback.");
+                        updateStatus("Playback Error. Fallback.");
+                        URL.revokeObjectURL(url);
                         fallbackSpeak(item, onEnd);
                     };
+
                     const playPromise = audio.play();
                     if (playPromise !== undefined) {
                         playPromise
-                            .then(() => updateStatus("Playing (Google Cloud Neural2)"))
+                            .then(() => updateStatus("Playing (Gemini Via Element)"))
                             .catch(e => {
-                                updateStatus(`Autoplay Blocked: ${e.message}. Fallback.`);
+                                updateStatus("Autoplay Blocked. Fallback.");
                                 fallbackSpeak(item, onEnd);
                             });
                     }
@@ -202,7 +245,7 @@ function speakOne(item, onEnd) {
                 }
             })
             .catch(e => {
-                updateStatus(`Critical Error: ${e.message}`);
+                updateStatus("Critical Error. Fallback.");
                 fallbackSpeak(item, onEnd);
             });
     } else {
