@@ -14,7 +14,9 @@ const STATE = {
     speechRate: 0.8,
     sessionGold: 0, // 今回獲得したゴールド
     totalGold: parseInt(localStorage.getItem('english_ear_total_gold')) || 0,
-    isTutorialOpen: !localStorage.getItem('english_ear_tutorial_done') // 初回はtrue
+    isTutorialOpen: !localStorage.getItem('english_ear_tutorial_done'), // 初回はtrue
+    googleApiKey: localStorage.getItem('english_ear_google_api_key') || '',
+    isSettingsOpen: false
 };
 
 // Rank System
@@ -69,17 +71,78 @@ function playWrongSound() {
 }
 
 // Text-to-Speech
-function speak(text, callback) {
-    if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'en-US';
-    u.rate = STATE.speechRate;
-    u.onend = () => { if (callback) callback(); };
-    window.speechSynthesis.speak(u);
+async function fetchGoogleTTS(text, rate) {
+    if (!STATE.googleApiKey) return null;
+
+    // レートの調整: Google APIは 0.25 〜 4.0。Web Speech APIの 0.5~1.2 と合わせる
+    // Web Speechのrate=1.0はGoogleの1.0とだいたい同じだが、微調整が必要かも。そのまま渡す。
+
+    const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${STATE.googleApiKey}`;
+    const body = {
+        input: { text: text },
+        voice: { languageCode: "en-US", name: "en-US-Neural2-F" }, // 日本人にも聞き取りやすいクリアな女性の声
+        audioConfig: { audioEncoding: "MP3", speakingRate: rate }
+    };
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        if (data.error) {
+            console.error("Google TTS Error:", data.error);
+            return null; // エラー時はフォールバック
+        }
+        return data.audioContent;
+    } catch (e) {
+        console.error("Fetch Error:", e);
+        return null;
+    }
 }
 
 function speakOne(item, onEnd) {
+    // APIキーがあればGoogle TTSを試みる
+    if (STATE.googleApiKey) {
+        fetchGoogleTTS(item.text, item.rate)
+            .then(audioContent => {
+                if (audioContent) {
+                    const audio = new Audio("data:audio/mp3;base64," + audioContent);
+
+                    // 正常終了時
+                    audio.onended = onEnd;
+
+                    // ロードエラー時
+                    audio.onerror = (e) => {
+                        console.error("Audio Load Error:", e);
+                        fallbackSpeak(item, onEnd);
+                    };
+
+                    // 再生試行
+                    const playPromise = audio.play();
+                    if (playPromise !== undefined) {
+                        playPromise.catch(e => {
+                            console.error("Audio Playback Error:", e);
+                            // 自動再生ブロックなどで再生できない場合はWeb Speech APIにフォールバック
+                            fallbackSpeak(item, onEnd);
+                        });
+                    }
+                } else {
+                    // API失敗時はフォールバック
+                    fallbackSpeak(item, onEnd);
+                }
+            })
+            .catch(e => {
+                console.error("Critical Error in speakOne async:", e);
+                fallbackSpeak(item, onEnd);
+            });
+    } else {
+        fallbackSpeak(item, onEnd);
+    }
+}
+
+function fallbackSpeak(item, onEnd) {
     if (!window.speechSynthesis) {
         onEnd();
         return;
@@ -98,37 +161,73 @@ function updateSpeechRate(val) {
 }
 
 // Game Logic
-function initGame() {
-    STATE.sessionGold = 0;
-    STATE.currentQuestionIndex = 0;
-    STATE.history = [];
-    STATE.isAnswered = false;
-    STATE.paused = false;
+// Game Logic
+async function initGame() {
+    try {
+        if (!window.PASSAGES || window.PASSAGES.length === 0) {
+            alert("Error: Vocabulary data not loaded. Please reload the page.");
+            return;
+        }
 
-    // シャッフルして2問だけ選ぶ（1ゲーム2パッセージ = 6問）
-    const pool = window.PASSAGES;
-    const shuffled = [...pool].sort(() => 0.5 - Math.random());
-    STATE.playlist = shuffled.slice(0, 2);
+        // StartボタンをLoading表示
+        const startBtn = document.querySelector('button[onclick="initGame()"]');
+        if (startBtn) {
+            startBtn.innerHTML = '<i data-lucide="loader" class="w-8 h-8 animate-spin"></i> Loading...';
+            lucide.createIcons();
+        }
 
-    loadPassage();
+        // UI更新待ち
+        await new Promise(r => setTimeout(r, 100));
+
+        STATE.sessionGold = 0;
+        STATE.currentQuestionIndex = 0;
+        STATE.history = [];
+        STATE.isAnswered = false;
+        STATE.paused = false;
+
+        // シャッフルして2問だけ選ぶ（1ゲーム2パッセージ = 6問）
+        const pool = window.PASSAGES;
+        const shuffled = [...pool].sort(() => 0.5 - Math.random());
+        STATE.playlist = shuffled.slice(0, 2);
+
+        loadPassage();
+    } catch (e) {
+        console.error("Game Init Error:", e);
+        alert("Game start failed: " + e.message);
+        showTitleScreen();
+    }
 }
 
 function goToTitle() {
     window.speechSynthesis.cancel();
-    // タイトルに戻るときはチュートリアルは開かない（意図的に開かない限り）
-    // ただし、もし本当に一度も閉じてない状態でゲーム開始して戻ってきたら...というケースは稀。
-    // 基本的にボタンから戻るので、ここではTutorialOpen状態を維持するか、falseにするか。
-    // ユーザー体験的にはfalseでリセットが良いが、初回のまま開始せずにリロードした場合は初期化ロジックでtrueになる。
-    STATE.isTutorialOpen = false; 
+    STATE.isTutorialOpen = false;
+    STATE.isSettingsOpen = false;
     showTitleScreen();
 }
 
 function toggleTutorial() {
     STATE.isTutorialOpen = !STATE.isTutorialOpen;
-    if (!STATE.isTutorialOpen) {
+    if (STATE.isTutorialOpen) STATE.isSettingsOpen = false; // 排他制御
+    if (!STATE.isTutorialOpen && !localStorage.getItem('english_ear_tutorial_done')) {
         localStorage.setItem('english_ear_tutorial_done', 'true');
     }
     showTitleScreen();
+}
+
+function toggleSettings() {
+    STATE.isSettingsOpen = !STATE.isSettingsOpen;
+    if (STATE.isSettingsOpen) STATE.isTutorialOpen = false; // 排他制御
+    showTitleScreen();
+}
+
+function saveSettings() {
+    const input = document.getElementById('apiKeyInput');
+    if (input) {
+        const key = input.value.trim();
+        STATE.googleApiKey = key;
+        localStorage.setItem('english_ear_google_api_key', key);
+    }
+    toggleSettings();
 }
 
 function togglePause() {
@@ -271,6 +370,11 @@ function showTitleScreen() {
                 <i data-lucide="crown" class="w-64 h-64 mx-auto text-white"></i>
             </div>
 
+            <!-- Settings Button -->
+            <button onclick="toggleSettings()" class="absolute top-4 left-4 p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors z-20">
+                <i data-lucide="settings" class="w-6 h-6 text-slate-300"></i>
+            </button>
+
             <!-- Help Button -->
             <button onclick="toggleTutorial()" class="absolute top-4 right-4 p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors z-20">
                 <i data-lucide="help-circle" class="w-6 h-6 text-slate-300"></i>
@@ -281,6 +385,13 @@ function showTitleScreen() {
             </div>
             <h1 class="text-4xl font-black mb-2 tracking-tight z-10 drop-shadow-lg">英検4級<br>Basic Listening</h1>
             <p class="text-slate-400 mb-8 text-lg z-10">Hearing & Reading Quest</p>
+            
+            <!-- API Status Badge -->
+            ${STATE.googleApiKey ? `
+                <div class="mb-4 z-10 inline-flex items-center gap-1 px-3 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-mono">
+                    <i data-lucide="check-circle" class="w-3 h-3"></i> Google Cloud Voice Active
+                </div>
+            ` : ''}
             
             <!-- Rank Card -->
             <div class="w-full max-w-xs bg-slate-800/80 backdrop-blur border border-slate-600 rounded-2xl p-4 mb-8 z-10 shadow-xl">
@@ -300,6 +411,39 @@ function showTitleScreen() {
                 Start Mission
             </button>
             <p class="mt-4 text-xs text-slate-500">2 Passages • 6 Questions</p>
+
+            <!-- Settings Modal -->
+            ${STATE.isSettingsOpen ? `
+            <div class="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
+                <div class="bg-slate-800 border border-slate-600 rounded-3xl p-6 w-full max-w-sm shadow-2xl relative overflow-hidden">
+                    <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-purple-500 to-pink-500"></div>
+                    
+                    <h2 class="text-xl font-bold mb-4 flex items-center gap-2 text-white">
+                        <i data-lucide="settings" class="w-5 h-5 text-purple-400"></i>
+                        Voice Settings
+                    </h2>
+
+                    <div class="mb-6">
+                        <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Google Cloud API Key</label>
+                        <input type="text" id="apiKeyInput" value="${STATE.googleApiKey}" placeholder="Paste API Key here..." 
+                            class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-500 transition-colors font-mono">
+                        <p class="text-[10px] text-slate-500 mt-2">
+                            To use high-quality Neural voices, please enter your Google Cloud API Key.
+                            <a href="https://console.cloud.google.com/apis/credentials" target="_blank" class="text-purple-400 hover:text-purple-300 underline">Get API Key here</a>
+                        </p>
+                    </div>
+
+                    <div class="flex gap-3">
+                        <button onclick="toggleSettings()" class="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-300 font-bold py-3 rounded-xl transition-colors">
+                            Cancel
+                        </button>
+                        <button onclick="saveSettings()" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 rounded-xl transition-colors shadow-lg shadow-purple-600/20">
+                            Save
+                        </button>
+                    </div>
+                </div>
+            </div>
+            ` : ''}
 
             <!-- Tutorial Modal -->
             ${STATE.isTutorialOpen ? `
