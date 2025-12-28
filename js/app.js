@@ -17,7 +17,9 @@ const STATE = {
     isTutorialOpen: !localStorage.getItem('english_ear_tutorial_done'), // 初回はtrue
     googleApiKey: localStorage.getItem('english_ear_google_api_key') || '',
     isSettingsOpen: false,
-    statusMessage: '' // 音声再生状況のデバッグ表示用
+    isSettingsOpen: false,
+    statusMessage: '', // 音声再生状況のデバッグ表示用
+    audioContext: null // Web Audio API用コンテキスト
 };
 
 // Rank System
@@ -91,23 +93,25 @@ async function fetchGoogleTTS(text, rate) {
         audioConfig: { audioEncoding: "MP3", speakingRate: rate }
     };
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8秒タイムアウト
+
     try {
         const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+            body: JSON.stringify(body),
+            signal: controller.signal
         });
+        clearTimeout(timeoutId);
 
-        // ネットワークエラー以外（400/403/500系）のハンドリング
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             const errMsg = errData.error && errData.error.message ? errData.error.message : response.statusText;
 
-            // 特定のエラー（API未有効化）を検知
             if (errMsg.includes("API has not been used") || errMsg.includes("disabled")) {
                 const link = `https://console.cloud.google.com/apis/library/texttospeech.googleapis.com?project=_`;
-                // リンクテキストが確実にクリックできるようにスタイル調整
-                const friendlyMsg = `<span class="">Cloud TTS APIが無効です。<a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">クリックして有効化</a></span>`;
+                const friendlyMsg = `<span class="">Cloud TTS APIが無効です。<br><a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">クリックして有効化</a></span>`;
                 updateStatus(friendlyMsg);
                 console.error("API Disabled Error detected");
                 return null;
@@ -125,49 +129,80 @@ async function fetchGoogleTTS(text, rate) {
         }
         return data.audioContent;
     } catch (e) {
-        updateStatus(`Fetch Exception: ${e.message}`);
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') {
+            updateStatus("Fetch Timeout (8s). Fallback.");
+        } else {
+            updateStatus(`Fetch Exception: ${e.message}`);
+        }
         console.error("Fetch Error:", e);
         return null;
     }
 }
 
+// Base64 -> ArrayBuffer変換
+function base64ToArrayBuffer(base64) {
+    const binaryX = atob(base64);
+    const len = binaryX.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryX.charCodeAt(i);
+    }
+    return bytes.buffer;
+}
+
 function speakOne(item, onEnd) {
-    // APIキーがあればGoogle TTSを試みる
     if (STATE.googleApiKey) {
         updateStatus("Requesting Google Voice...");
         fetchGoogleTTS(item.text, item.rate)
-            .then(audioContent => {
-                if (audioContent) {
-                    updateStatus("Decoding Audio...");
-                    const audio = new Audio("data:audio/mp3;base64," + audioContent);
+            .then(async (audioContent) => {
+                // AudioContext優先
+                if (audioContent && STATE.audioContext) {
+                    updateStatus("Decoding via AudioContext...");
+                    try {
+                        const arrayBuffer = base64ToArrayBuffer(audioContent);
+                        const audioBuffer = await STATE.audioContext.decodeAudioData(arrayBuffer);
 
+                        const source = STATE.audioContext.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.connect(STATE.audioContext.destination);
+
+                        source.onended = () => {
+                            updateStatus("Finished (AudioContext)");
+                            onEnd();
+                        };
+
+                        source.start(0);
+                        updateStatus("Playing (AudioContext)");
+                    } catch (decodeErr) {
+                        console.error("Decode Error:", decodeErr);
+                        updateStatus("Decode Failed. Fallback.");
+                        fallbackSpeak(item, onEnd);
+                    }
+                }
+                // Contextがない場合の古いフォールバック
+                else if (audioContent) {
+                    updateStatus("Fallback to generic Audio element...");
+                    const audio = new Audio("data:audio/mp3;base64," + audioContent);
                     audio.onended = () => {
                         updateStatus("Finished (Google)");
                         onEnd();
                     };
-
                     audio.onerror = (e) => {
                         updateStatus("Audio Decode Error. Fallback.");
-                        console.error("Audio Load Error:", e);
                         fallbackSpeak(item, onEnd);
                     };
-
                     const playPromise = audio.play();
                     if (playPromise !== undefined) {
                         playPromise
-                            .then(() => {
-                                updateStatus("Playing (Google Cloud Neural2)");
-                            })
+                            .then(() => updateStatus("Playing (Google Cloud Neural2)"))
                             .catch(e => {
                                 updateStatus(`Autoplay Blocked: ${e.message}. Fallback.`);
-                                console.error("Audio Playback Error:", e);
                                 fallbackSpeak(item, onEnd);
                             });
                     }
                 } else {
-                    // API失敗時はフォールバック
-                    // 少し遅延させてフォールバック
-                    setTimeout(() => fallbackSpeak(item, onEnd), 500);
+                    setTimeout(() => fallbackSpeak(item, onEnd), 200);
                 }
             })
             .catch(e => {
@@ -211,6 +246,16 @@ async function initGame() {
         if (startBtn) {
             startBtn.innerHTML = '<i data-lucide="loader" class="w-8 h-8 animate-spin"></i> Loading...';
             lucide.createIcons();
+        }
+
+        // AudioContextの初期化と再開 (Mobile対応)
+        if (!STATE.audioContext) {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            STATE.audioContext = new AudioContext();
+        }
+        if (STATE.audioContext.state === 'suspended') {
+            await STATE.audioContext.resume();
+            console.log("AudioContext Resumed");
         }
 
         // UI更新待ち
