@@ -80,29 +80,41 @@ function updateStatus(msg) {
     if (el) el.innerHTML = msg; // リンクを表示可能にするためHTMLとして設定
 }
 
-// WAV Header Generator for Gemini PCM
-function createWavHeader(dataLength, sampleRate, numChannels, bitsPerSample) {
+// --- Audio Utility Functions (Copied from Successful App) ---
+const createWavHeader = (dataLength, sampleRate, numChannels, bitsPerSample) => {
     const blockAlign = (numChannels * bitsPerSample) / 8;
     const byteRate = sampleRate * blockAlign;
     const buffer = new ArrayBuffer(44);
     const view = new DataView(buffer);
-    view.setUint8(0, 82); view.setUint8(1, 73); view.setUint8(2, 70); view.setUint8(3, 70); // RIFF
+    view.setUint8(0, 'R'.charCodeAt(0));
+    view.setUint8(1, 'I'.charCodeAt(0));
+    view.setUint8(2, 'F'.charCodeAt(0));
+    view.setUint8(3, 'F'.charCodeAt(0));
     view.setUint32(4, 36 + dataLength, true);
-    view.setUint8(8, 87); view.setUint8(9, 65); view.setUint8(10, 86); view.setUint8(11, 69); // WAVE
-    view.setUint8(12, 102); view.setUint8(13, 109); view.setUint8(14, 116); view.setUint8(15, 32); // fmt 
+    view.setUint8(8, 'W'.charCodeAt(0));
+    view.setUint8(9, 'A'.charCodeAt(0));
+    view.setUint8(10, 'V'.charCodeAt(0));
+    view.setUint8(11, 'E'.charCodeAt(0));
+    view.setUint8(12, 'f'.charCodeAt(0));
+    view.setUint8(13, 'm'.charCodeAt(0));
+    view.setUint8(14, 't'.charCodeAt(0));
+    view.setUint8(15, ' '.charCodeAt(0));
     view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // PCM
+    view.setUint16(20, 1, true);
     view.setUint16(22, numChannels, true);
     view.setUint32(24, sampleRate, true);
     view.setUint32(28, byteRate, true);
     view.setUint16(32, blockAlign, true);
     view.setUint16(34, bitsPerSample, true);
-    view.setUint8(36, 100); view.setUint8(37, 97); view.setUint8(38, 116); view.setUint8(39, 97); // data
+    view.setUint8(36, 'd'.charCodeAt(0));
+    view.setUint8(37, 'a'.charCodeAt(0));
+    view.setUint8(38, 't'.charCodeAt(0));
+    view.setUint8(39, 'a'.charCodeAt(0));
     view.setUint32(40, dataLength, true);
     return new Uint8Array(buffer);
-}
+};
 
-// Base64 PCM -> WAV ArrayBuffer
+// Base64 PCM -> WAV ArrayBuffer (Adapted from base64ToWavBlob)
 function base64ToWavArrayBuffer(base64, sampleRate = 24000) {
     const binaryString = atob(base64);
     const len = binaryString.length;
@@ -110,23 +122,23 @@ function base64ToWavArrayBuffer(base64, sampleRate = 24000) {
     for (let i = 0; i < len; i++) {
         bytes[i] = binaryString.charCodeAt(i);
     }
-    // Gemini usually returns 24kHz mono 16-bit PCM
-    const header = createWavHeader(len, sampleRate, 1, 16);
-    const wav = new Uint8Array(header.length + len);
-    wav.set(header);
-    wav.set(bytes, header.length);
-    return wav.buffer;
+    const wavHeader = createWavHeader(len, sampleRate, 1, 16);
+    const wavFile = new Uint8Array(wavHeader.length + len);
+    wavFile.set(wavHeader);
+    wavFile.set(bytes, wavHeader.length);
+    return wavFile.buffer;
 }
 
-// Text-to-Speech via Gemini API (Free Tier Compatible)
+// 試行するモデルのリスト (成功アプリの実績重視)
+const GEMINI_MODELS = [
+    "gemini-2.5-flash-preview-tts", // Exact name from successful app
+    "gemini-2.0-flash-exp",         // Backup
+    "gemini-1.5-flash"              // Backup
+];
+
 async function fetchGoogleTTS(text, rate) {
     const apiKey = STATE.googleApiKey.trim();
     if (!apiKey) return null;
-
-    updateStatus("Connecting to Gemini AI...");
-
-    // Gemini 2.0 Flash Exp (Audio capability)
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
 
     const body = {
         contents: [{ parts: [{ text: text }] }],
@@ -140,43 +152,56 @@ async function fetchGoogleTTS(text, rate) {
         }
     };
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    // モデルを順番に試すループ
+    for (const model of GEMINI_MODELS) {
+        // ユーザー要望: トライしているモデル名をリアルタイム表示
+        updateStatus(`Requesting: ${model}...`);
 
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-        if (!response.ok) {
-            const err = await response.json().catch(() => ({}));
-            const msg = err.error ? err.error.message : response.statusText;
-            console.warn("Gemini API Error:", response.status, msg);
-            // エラー原因を画面に表示する (デバッグ用)
-            updateStatus(`Gemini Error: ${response.status} ${msg}`);
-            return null;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+                console.warn(`Gemini API Error (${model}):`, response.status);
+                // 失敗したら画面にも表示しつつ、次へ
+                updateStatus(`Error (${model}): ${response.status}. Trying next...`);
+                // UI更新のために少し待つ (オプション)
+                await new Promise(r => setTimeout(r, 500));
+                continue;
+            }
+
+            const data = await response.json();
+            const base64Audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+            if (!base64Audio) {
+                console.warn(`Gemini: No audio data in response from ${model}`);
+                continue;
+            }
+
+            updateStatus(`Playing (Gemini: ${model})`);
+            return base64Audio;
+
+        } catch (e) {
+            clearTimeout(timeoutId);
+            console.error(`Fetch Exception (${model}):`, e);
+            updateStatus(`Exception (${model}). Trying next...`);
+            continue;
         }
-
-        const data = await response.json();
-        const base64Audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-        if (!base64Audio) {
-            console.warn("Gemini: No audio data in response");
-            updateStatus("Gemini: No Audio Data. Fallback.");
-            return null;
-        }
-        return base64Audio; // Raw PCM Base64
-
-    } catch (e) {
-        clearTimeout(timeoutId);
-        console.error("Fetch Exception:", e);
-        updateStatus("Connection issue. Use Fallback.");
-        return null;
     }
+
+    // 全モデル失敗時
+    updateStatus("All Gemini models failed. Switching to Standard Voice.");
+    return null;
 }
 
 
@@ -195,6 +220,7 @@ function speakOne(item, onEnd) {
 
                         const source = STATE.audioContext.createBufferSource();
                         source.buffer = audioBuffer;
+                        STATE.currentAudioSource = source; // Store for real-time speed control
                         // Gemini doesn't support server-side rate yet, so we do it client-side
                         source.playbackRate.value = item.rate;
 
@@ -222,6 +248,7 @@ function speakOne(item, onEnd) {
                     const url = URL.createObjectURL(blob);
 
                     const audio = new Audio(url);
+                    STATE.currentAudioSource = audio; // Store for real-time speed control
                     audio.playbackRate = item.rate; // Client-side speed
 
                     audio.onended = () => {
@@ -270,9 +297,29 @@ function fallbackSpeak(item, onEnd) {
     window.speechSynthesis.speak(u);
 }
 
-function updateSpeechRate(val) {
-    STATE.speechRate = parseFloat(val);
-    document.getElementById('rate-label').innerText = `Speed: ${STATE.speechRate.toFixed(1)}x`;
+function changeSpeed(delta) {
+    let newRate = STATE.speechRate + delta;
+    if (newRate < 0.5) newRate = 0.5;
+    if (newRate > 2.5) newRate = 2.5; // Allow wider range
+    STATE.speechRate = Math.round(newRate * 10) / 10;
+
+    // UI Update
+    const label = document.getElementById('rate-label');
+    if (label) label.innerText = `${STATE.speechRate.toFixed(1)}x`;
+
+    // Real-time Audio Update
+    if (STATE.currentAudioSource) {
+        try {
+            // AudioContext SourceNode
+            if (STATE.currentAudioSource.playbackRate && STATE.currentAudioSource.playbackRate.setValueAtTime) {
+                STATE.currentAudioSource.playbackRate.setValueAtTime(STATE.speechRate, STATE.audioContext.currentTime);
+            }
+            // HTMLAudioElement
+            else if (typeof STATE.currentAudioSource.playbackRate === 'number' || typeof STATE.currentAudioSource.playbackRate === 'object') {
+                STATE.currentAudioSource.playbackRate = STATE.speechRate;
+            }
+        } catch (e) { console.error("Speed update error:", e); }
+    }
 }
 
 // Game Logic
@@ -410,13 +457,25 @@ function playPassageSequence(passage, target) {
 
     // 全文読み上げは各パッセージの最初の問題のみ
     if (STATE.subQuestionIndex === 0) {
-        passage.sentences.forEach(s => {
-            sequence.push({ text: s.text, rate: STATE.speechRate });
+        // パッセージ + 質問をまとめて1回のリクエストにする (安定化のため)
+        // Question Numberの前に無音区間を作るためにピリオド等を多めに入れる
+        const fullPassageText = passage.sentences.map(s => s.text).join(' ');
+        const questionText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
+
+        // 結合して1つの音声としてリクエスト
+        sequence.push({
+            text: `${fullPassageText} ...... ${questionText}`,
+            rate: STATE.speechRate
         });
+    } else {
+        // 2問目以降は質問のみ (これも一回で)
+        const qText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
+        sequence.push({ text: qText, rate: STATE.speechRate });
     }
 
-    sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: 1.0, delay: 1000 });
-    sequence.push({ text: target.text, rate: STATE.speechRate, delay: 500, isTarget: true });
+    // 古い定義を削除
+    // sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: 1.0, delay: 1000 });
+    // sequence.push({ text: target.text, rate: STATE.speechRate, delay: 500, isTarget: true });
 
     speakRecursive(sequence, 0);
 }
@@ -514,12 +573,12 @@ function showTitleScreen() {
             <!-- API Status Badge -->
             ${STATE.googleApiKey ? `
                 <div class="mb-4 z-10 inline-flex items-center gap-1 px-3 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-mono">
-                    <i data-lucide="check-circle" class="w-3 h-3"></i> Google Cloud Voice Active
+                    <i data-lucide="sparkles" class="w-3 h-3"></i> Gemini AI Voice Active
                 </div>
             ` : ''}
             
             <!-- Rank Card -->
-            <div class="w-full max-w-xs bg-slate-800/80 backdrop-blur border border-slate-600 rounded-2xl p-4 mb-8 z-10 shadow-xl">
+            <div class="w-full max-w-xs bg-slate-800/80 backdrop-blur border border-slate-600 rounded-2xl p-4 mb-4 z-10 shadow-xl">
                  <div class="text-xs text-slate-400 font-bold uppercase tracking-widest mb-1">Current Rank</div>
                  <div class="flex items-center justify-center gap-2 mb-2">
                     <span class="text-3xl">${rank.icon}</span>
@@ -528,6 +587,24 @@ function showTitleScreen() {
                  <div class="flex items-center justify-center gap-2 bg-slate-900/50 rounded-lg py-2">
                     <i data-lucide="coins" class="w-5 h-5 text-yellow-400"></i>
                     <span class="text-xl font-mono text-yellow-400 font-bold">${STATE.totalGold.toLocaleString()} G</span>
+                 </div>
+            </div>
+
+            <!-- Initial Speed Setting -->
+            <div class="w-full max-w-xs mb-8 z-10">
+                 <div class="flex items-center justify-between bg-slate-800/80 px-4 py-2 rounded-xl border border-slate-600 shadow-lg backdrop-blur-sm">
+                    <span class="text-xs text-slate-400 font-bold uppercase tracking-widest">Rate</span>
+                    <div class="flex items-center gap-4">
+                        <button onclick="changeSpeed(-0.1)" class="p-1 text-slate-400 hover:text-white rounded-full hover:bg-slate-700 transition-colors active:scale-90">
+                            <i data-lucide="minus" class="w-4 h-4"></i>
+                        </button>
+                        <div id="rate-label" class="text-base font-black font-mono text-emerald-400 w-12 text-center tabular-nums">
+                            ${STATE.speechRate.toFixed(1)}x
+                        </div>
+                        <button onclick="changeSpeed(0.1)" class="p-1 text-slate-400 hover:text-white rounded-full hover:bg-slate-700 transition-colors active:scale-90">
+                            <i data-lucide="plus" class="w-4 h-4"></i>
+                        </button>
+                    </div>
                  </div>
             </div>
 
@@ -720,12 +797,17 @@ function renderGameContent() {
                     </div>
                 </button>
                 
-                <!-- Speed Control -->
-                <div class="flex items-center gap-2 bg-slate-800/80 px-3 py-1 rounded-full border border-slate-700 mb-2">
-                    <input type="range" min="0.5" max="1.2" step="0.1" value="${STATE.speechRate}" 
-                        oninput="updateSpeechRate(this.value)" 
-                        class="w-20 h-1 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-emerald-500">
-                    <span id="rate-label" class="text-[10px] font-mono text-emerald-400 w-12 text-right">${STATE.speechRate.toFixed(1)}x</span>
+                <!-- Speed Control (Buttons) -->
+                <div class="flex items-center gap-2 bg-slate-800/80 px-4 py-2 rounded-full border border-slate-700 mb-2 shadow-lg">
+                    <button onclick="changeSpeed(-0.1)" class="p-1 text-slate-400 hover:text-white rounded-full hover:bg-slate-700 transition-colors active:scale-90">
+                        <i data-lucide="minus" class="w-5 h-5"></i>
+                    </button>
+                    <div id="rate-label" class="text-sm font-black font-mono text-emerald-400 w-16 text-center tabular-nums">
+                        ${STATE.speechRate.toFixed(1)}x
+                    </div>
+                    <button onclick="changeSpeed(0.1)" class="p-1 text-slate-400 hover:text-white rounded-full hover:bg-slate-700 transition-colors active:scale-90">
+                        <i data-lucide="plus" class="w-5 h-5"></i>
+                    </button>
                 </div>
 
                 ${STATE.isAnswered ? `
