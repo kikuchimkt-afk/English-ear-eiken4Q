@@ -82,11 +82,12 @@ function updateStatus(msg) {
 
 // Text-to-Speech
 async function fetchGoogleTTS(text, rate) {
-    if (!STATE.googleApiKey) return null;
+    const apiKey = STATE.googleApiKey.trim();
+    if (!apiKey) return null;
 
     updateStatus("Connecting to Google Cloud...");
 
-    const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${STATE.googleApiKey}`;
+    const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`;
     const body = {
         input: { text: text },
         voice: { languageCode: "en-US", name: "en-US-Neural2-F" },
@@ -108,15 +109,15 @@ async function fetchGoogleTTS(text, rate) {
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             const errMsg = errData.error && errData.error.message ? errData.error.message : response.statusText;
+
             // エラーメッセージの内容で分岐
-            // エラーメッセージの内容で分岐
-            // 1. API自体の未有効化 or プロジェクト単位の問題
+            // 1. API自体の未有効化 (プロジェクトでAPIをONにしていない)
             if (errMsg.includes("API has not been used") || errMsg.includes("disabled")) {
-                const link = `https://console.cloud.google.com/apis/credentials`;
-                // 初心者向けに具体的に指示
-                const friendlyMsg = `<span class="">エラー: APIキーの制限設定を確認してください。<br>Google Cloud設定で、このキーの<br>「アプリケーションの制限」を「なし」に<br>試しに変更してください。<a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">設定画面へ</a></span>`;
+                // APIライブラリのページへ直接誘導
+                const link = `https://console.cloud.google.com/apis/library/texttospeech.googleapis.com`;
+                const friendlyMsg = `<span class="">Cloud TTS APIが有効になっていません。<br>制限なしでも、API自体の「有効化」が必要です。<br><a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">ここを押して「有効にする」をクリック</a></span>`;
                 updateStatus(friendlyMsg);
-                console.error("API Restriction/Disabled Error:", errMsg);
+                console.error("API Disabled Error detected");
                 return null;
             }
 
