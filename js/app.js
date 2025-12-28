@@ -16,7 +16,8 @@ const STATE = {
     totalGold: parseInt(localStorage.getItem('english_ear_total_gold')) || 0,
     isTutorialOpen: !localStorage.getItem('english_ear_tutorial_done'), // 初回はtrue
     googleApiKey: localStorage.getItem('english_ear_google_api_key') || '',
-    isSettingsOpen: false
+    isSettingsOpen: false,
+    statusMessage: '' // 音声再生状況のデバッグ表示用
 };
 
 // Rank System
@@ -70,17 +71,23 @@ function playWrongSound() {
     playTone(150, 'sawtooth', 0.3);
 }
 
+
+function updateStatus(msg) {
+    STATE.statusMessage = msg;
+    const el = document.getElementById('status-monitor');
+    if (el) el.innerHTML = msg; // リンクを表示可能にするためHTMLとして設定
+}
+
 // Text-to-Speech
 async function fetchGoogleTTS(text, rate) {
     if (!STATE.googleApiKey) return null;
 
-    // レートの調整: Google APIは 0.25 〜 4.0。Web Speech APIの 0.5~1.2 と合わせる
-    // Web Speechのrate=1.0はGoogleの1.0とだいたい同じだが、微調整が必要かも。そのまま渡す。
+    updateStatus("Connecting to Google Cloud...");
 
     const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${STATE.googleApiKey}`;
     const body = {
         input: { text: text },
-        voice: { languageCode: "en-US", name: "en-US-Neural2-F" }, // 日本人にも聞き取りやすいクリアな女性の声
+        voice: { languageCode: "en-US", name: "en-US-Neural2-F" },
         audioConfig: { audioEncoding: "MP3", speakingRate: rate }
     };
 
@@ -90,13 +97,35 @@ async function fetchGoogleTTS(text, rate) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
+
+        // ネットワークエラー以外（400/403/500系）のハンドリング
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            const errMsg = errData.error && errData.error.message ? errData.error.message : response.statusText;
+
+            // 特定のエラー（API未有効化）を検知
+            if (errMsg.includes("API has not been used") || errMsg.includes("disabled")) {
+                const link = `https://console.cloud.google.com/apis/library/texttospeech.googleapis.com?project=_`;
+                // リンクテキストが確実にクリックできるようにスタイル調整
+                const friendlyMsg = `<span class="">Cloud TTS APIが無効です。<a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">クリックして有効化</a></span>`;
+                updateStatus(friendlyMsg);
+                console.error("API Disabled Error detected");
+                return null;
+            }
+
+            updateStatus(`API Error: ${response.status} ${errMsg}`);
+            console.error("Google TTS Error:", errData);
+            return null;
+        }
+
         const data = await response.json();
         if (data.error) {
-            console.error("Google TTS Error:", data.error);
-            return null; // エラー時はフォールバック
+            updateStatus(`API Error: ${data.error.message}`);
+            return null;
         }
         return data.audioContent;
     } catch (e) {
+        updateStatus(`Fetch Exception: ${e.message}`);
         console.error("Fetch Error:", e);
         return null;
     }
@@ -105,36 +134,44 @@ async function fetchGoogleTTS(text, rate) {
 function speakOne(item, onEnd) {
     // APIキーがあればGoogle TTSを試みる
     if (STATE.googleApiKey) {
+        updateStatus("Requesting Google Voice...");
         fetchGoogleTTS(item.text, item.rate)
             .then(audioContent => {
                 if (audioContent) {
+                    updateStatus("Decoding Audio...");
                     const audio = new Audio("data:audio/mp3;base64," + audioContent);
 
-                    // 正常終了時
-                    audio.onended = onEnd;
+                    audio.onended = () => {
+                        updateStatus("Finished (Google)");
+                        onEnd();
+                    };
 
-                    // ロードエラー時
                     audio.onerror = (e) => {
+                        updateStatus("Audio Decode Error. Fallback.");
                         console.error("Audio Load Error:", e);
                         fallbackSpeak(item, onEnd);
                     };
 
-                    // 再生試行
                     const playPromise = audio.play();
                     if (playPromise !== undefined) {
-                        playPromise.catch(e => {
-                            console.error("Audio Playback Error:", e);
-                            // 自動再生ブロックなどで再生できない場合はWeb Speech APIにフォールバック
-                            fallbackSpeak(item, onEnd);
-                        });
+                        playPromise
+                            .then(() => {
+                                updateStatus("Playing (Google Cloud Neural2)");
+                            })
+                            .catch(e => {
+                                updateStatus(`Autoplay Blocked: ${e.message}. Fallback.`);
+                                console.error("Audio Playback Error:", e);
+                                fallbackSpeak(item, onEnd);
+                            });
                     }
                 } else {
                     // API失敗時はフォールバック
-                    fallbackSpeak(item, onEnd);
+                    // 少し遅延させてフォールバック
+                    setTimeout(() => fallbackSpeak(item, onEnd), 500);
                 }
             })
             .catch(e => {
-                console.error("Critical Error in speakOne async:", e);
+                updateStatus(`Critical Error: ${e.message}`);
                 fallbackSpeak(item, onEnd);
             });
     } else {
@@ -610,8 +647,13 @@ function renderGameContent() {
                         </div>
                     </div>
                 ` : `
-                    <div class="h-9 flex items-center justify-center">
+                    <div class="h-12 flex flex-col items-center justify-center">
                         <span class="text-slate-500/50 text-[10px] uppercase tracking-[0.2em] font-bold animate-pulse">Listening...</span>
+                        
+                        <!-- Status Monitor for Debugging -->
+                        <div id="status-monitor" class="mt-2 text-[10px] font-mono text-cyan-400/80 h-4 overflow-hidden truncate max-w-full px-4">
+                            ${STATE.statusMessage || 'Ready'}
+                        </div>
                     </div>
                 `}
             </div>
