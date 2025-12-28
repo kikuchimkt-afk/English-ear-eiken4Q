@@ -87,7 +87,9 @@ async function fetchGoogleTTS(text, rate) {
 
     updateStatus("Connecting to Google Cloud...");
 
-    const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`;
+    // APIキーをURLパラメータではなくヘッダーで送る方式に変更（トラブル回避のため）
+    const url = `https://texttospeech.googleapis.com/v1/text:synthesize`;
+
     const body = {
         input: { text: text },
         voice: { languageCode: "en-US", name: "en-US-Neural2-F" },
@@ -95,58 +97,41 @@ async function fetchGoogleTTS(text, rate) {
     };
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8秒タイムアウト
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
     try {
         const response = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Goog-Api-Key': apiKey // ヘッダー認証に変更
+            },
             body: JSON.stringify(body),
             signal: controller.signal
         });
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            const errMsg = errData.error && errData.error.message ? errData.error.message : response.statusText;
-
-            // エラーメッセージの内容で分岐
-            // 1. API自体の未有効化 (プロジェクトでAPIをONにしていない)
-            if (errMsg.includes("API has not been used") || errMsg.includes("disabled")) {
-                // APIライブラリのページへ直接誘導
-                const link = `https://console.cloud.google.com/apis/library/texttospeech.googleapis.com`;
-                const friendlyMsg = `<span class="">Cloud TTS APIが有効になっていません。<br>制限なしでも、API自体の「有効化」が必要です。<br><a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">ここを押して「有効にする」をクリック</a></span>`;
-                updateStatus(friendlyMsg);
-                console.error("API Disabled Error detected");
-                return null;
-            }
-
-            // 2. IPリファラー制限など
-            if (errMsg.includes("authorized") || errMsg.includes("referer") || errMsg.includes("ip address")) {
-                updateStatus(`API Key Error: キーの制限設定(IP/Referer)でブロックされました。`);
-                console.error("API Key Restriction Error:", errMsg);
-                return null;
-            }
-
-            updateStatus(`API Error: ${response.status} ${errMsg}`);
-            console.error("Google TTS Error:", errData);
+            // 詳細なエラーチェックやリンク表示は廃止し、即座にフォールバックさせる
+            // ユーザーが「他のアプリで動く」と言う場合、他アプリはエラーを無視して
+            // 標準音声にフォールバックしている可能性が高いため、それに合わせる
+            console.warn("Google TTS API Response not OK. Status:", response.status);
+            updateStatus("API unavailable. Using Standard Voice.");
             return null;
         }
 
         const data = await response.json();
         if (data.error) {
-            updateStatus(`API Error: ${data.error.message}`);
+            console.warn("Google TTS API Error Data:", data.error);
+            updateStatus("API Error. Using Standard Voice.");
             return null;
         }
         return data.audioContent;
     } catch (e) {
         clearTimeout(timeoutId);
-        if (e.name === 'AbortError') {
-            updateStatus("Fetch Timeout (8s). Fallback.");
-        } else {
-            updateStatus(`Fetch Exception: ${e.message}`);
-        }
-        console.error("Fetch Error:", e);
+        console.error("Fetch Exception:", e);
+        // タイムアウトやネットワークエラー時も静かにフォールバック
+        updateStatus("Connection issue. Using Standard Voice.");
         return null;
     }
 }
