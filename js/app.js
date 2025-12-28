@@ -108,12 +108,22 @@ async function fetchGoogleTTS(text, rate) {
         if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             const errMsg = errData.error && errData.error.message ? errData.error.message : response.statusText;
-
+            // エラーメッセージの内容で分岐
+            // エラーメッセージの内容で分岐
+            // 1. API自体の未有効化 or プロジェクト単位の問題
             if (errMsg.includes("API has not been used") || errMsg.includes("disabled")) {
-                const link = `https://console.cloud.google.com/apis/library/texttospeech.googleapis.com?project=_`;
-                const friendlyMsg = `<span class="">Cloud TTS APIが無効です。<br><a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">クリックして有効化</a></span>`;
+                const link = `https://console.cloud.google.com/apis/credentials`;
+                // 初心者向けに具体的に指示
+                const friendlyMsg = `<span class="">エラー: APIキーの制限設定を確認してください。<br>Google Cloud設定で、このキーの<br>「アプリケーションの制限」を「なし」に<br>試しに変更してください。<a href="${link}" target="_blank" class="underline font-bold text-yellow-400 pointer-events-auto relative z-50">設定画面へ</a></span>`;
                 updateStatus(friendlyMsg);
-                console.error("API Disabled Error detected");
+                console.error("API Restriction/Disabled Error:", errMsg);
+                return null;
+            }
+
+            // 2. IPリファラー制限など
+            if (errMsg.includes("authorized") || errMsg.includes("referer") || errMsg.includes("ip address")) {
+                updateStatus(`API Key Error: キーの制限設定(IP/Referer)でブロックされました。`);
+                console.error("API Key Restriction Error:", errMsg);
                 return null;
             }
 
@@ -696,7 +706,7 @@ function renderGameContent() {
                         <span class="text-slate-500/50 text-[10px] uppercase tracking-[0.2em] font-bold animate-pulse">Listening...</span>
                         
                         <!-- Status Monitor for Debugging -->
-                        <div id="status-monitor" class="mt-2 text-[10px] font-mono text-cyan-400/80 h-4 overflow-hidden truncate max-w-full px-4">
+                        <div id="status-monitor" class="mt-2 text-[10px] font-mono text-cyan-400/80 min-h-[1rem] max-w-full px-4 text-center leading-tight">
                             ${STATE.statusMessage || 'Ready'}
                         </div>
                     </div>
