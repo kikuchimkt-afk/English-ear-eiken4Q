@@ -427,10 +427,23 @@ function showTitleScreen() {
                         <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Google Cloud API Key</label>
                         <input type="text" id="apiKeyInput" value="${STATE.googleApiKey}" placeholder="Paste API Key here..." 
                             class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-500 transition-colors font-mono">
-                        <p class="text-[10px] text-slate-500 mt-2">
-                            To use high-quality Neural voices, please enter your Google Cloud API Key.
-                            <a href="https://console.cloud.google.com/apis/credentials" target="_blank" class="text-purple-400 hover:text-purple-300 underline">Get API Key here</a>
-                        </p>
+                        <div class="text-[10px] text-slate-400 mt-3 bg-slate-900/50 p-3 rounded-lg border border-slate-700">
+                            <div class="font-bold text-slate-300 mb-1">APIキーの入手手順:</div>
+                            <ol class="list-decimal list-inside space-y-1 ml-1 text-slate-500">
+                                <li>
+                                    <a href="https://aistudio.google.com/app/api-keys" target="_blank" class="text-purple-400 hover:text-purple-300 underline inline-flex items-center gap-1 font-bold">
+                                        Google AI Studio <i data-lucide="external-link" class="w-3 h-3"></i>
+                                    </a>
+                                    へアクセス
+                                </li>
+                                <li>「Create API key」をクリック</li>
+                                <li>作成されたキーをコピーしてここに入力</li>
+                            </ol>
+                            <div class="mt-2 pt-2 border-t border-slate-700/50 text-[10px] text-emerald-400/80 flex items-center gap-1">
+                                <i data-lucide="check-circle-2" class="w-3 h-3"></i>
+                                <span>高品質な音声読み上げが有効になります</span>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="flex gap-3">
