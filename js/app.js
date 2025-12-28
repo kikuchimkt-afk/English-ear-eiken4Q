@@ -153,8 +153,11 @@ async function fetchGoogleTTS(text, rate) {
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-            console.warn("Gemini API Status:", response.status);
-            updateStatus("API unavailable (Gemini). Use Fallback.");
+            const err = await response.json().catch(() => ({}));
+            const msg = err.error ? err.error.message : response.statusText;
+            console.warn("Gemini API Error:", response.status, msg);
+            // エラー原因を画面に表示する (デバッグ用)
+            updateStatus(`Gemini Error: ${response.status} ${msg}`);
             return null;
         }
 
@@ -162,7 +165,8 @@ async function fetchGoogleTTS(text, rate) {
         const base64Audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
 
         if (!base64Audio) {
-            updateStatus("No audio data. Use Fallback.");
+            console.warn("Gemini: No audio data in response");
+            updateStatus("Gemini: No Audio Data. Fallback.");
             return null;
         }
         return base64Audio; // Raw PCM Base64
