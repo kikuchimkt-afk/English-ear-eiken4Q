@@ -274,25 +274,48 @@ function playPassageSequence(passage, target) {
 
     // 全文読み上げは各パッセージの最初の問題のみ
     if (STATE.subQuestionIndex === 0) {
-        // パッセージ + 質問をまとめて1回のリクエストにする (安定化のため)
-        // Question Numberの前に無音区間を作るためにピリオド等を多めに入れる
-        const fullPassageText = passage.sentences.map(s => s.text).join(' ');
-        const questionText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
+        // APIの文字数制限（Youdao等は短文向け）を回避するため、
+        // 1文ずつキューに追加して再生するスタイルに変更
 
-        // 結合して1つの音声としてリクエスト
-        sequence.push({
-            text: `${fullPassageText} ...... ${questionText}`,
-            rate: STATE.speechRate
+        // 1. Title (Optional, skipping for now to keep it simple or add if needed)
+        // sequence.push({ text: passage.title, rate: STATE.speechRate });
+
+        // 2. Sentences
+        passage.sentences.forEach((s, index) => {
+            sequence.push({
+                text: s.text,
+                rate: STATE.speechRate,
+                delay: index === 0 ? 500 : 800 // 最初の文は500ms, 以降は少し間隔をあける
+            });
         });
-    } else {
-        // 2問目以降は質問のみ (これも一回で)
-        const qText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
-        sequence.push({ text: qText, rate: STATE.speechRate });
-    }
 
-    // 古い定義を削除
-    // sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: 1.0, delay: 1000 });
-    // sequence.push({ text: target.text, rate: STATE.speechRate, delay: 500, isTarget: true });
+        // 3. Question Transition
+        sequence.push({
+            text: `Question Number ${STATE.subQuestionIndex + 1}.`,
+            rate: STATE.speechRate,
+            delay: 1500 // パッセージと質問の間に長めのポーズ
+        });
+
+        // 4. Question Target
+        sequence.push({
+            text: target.text,
+            rate: STATE.speechRate,
+            delay: 1000
+        });
+
+    } else {
+        // 2問目以降は質問のみ
+        sequence.push({
+            text: `Question Number ${STATE.subQuestionIndex + 1}.`,
+            rate: STATE.speechRate,
+            delay: 500
+        });
+        sequence.push({
+            text: target.text,
+            rate: STATE.speechRate,
+            delay: 1000
+        });
+    }
 
     speakRecursive(sequence, 0);
 }
