@@ -15,12 +15,9 @@ const STATE = {
     sessionGold: 0, // 今回獲得したゴールド
     totalGold: parseInt(localStorage.getItem('english_ear_total_gold')) || 0,
     isTutorialOpen: !localStorage.getItem('english_ear_tutorial_done'), // 初回はtrue
-    googleApiKey: localStorage.getItem('english_ear_google_api_key') || '',
-    isSettingsOpen: false,
     isSettingsOpen: false,
     statusMessage: '', // 音声再生状況のデバッグ表示用
-    audioContext: null, // Web Audio API用コンテキスト
-    audioCache: {} // { "passageIndex-subIndex": Promise<base64> }
+    audioContext: null // Web Audio API用コンテキスト
 };
 
 // Rank System
@@ -81,348 +78,41 @@ function updateStatus(msg) {
     if (el) el.innerHTML = msg; // リンクを表示可能にするためHTMLとして設定
 }
 
-// --- Audio Utility Functions (Copied from Successful App) ---
-const createWavHeader = (dataLength, sampleRate, numChannels, bitsPerSample) => {
-    const blockAlign = (numChannels * bitsPerSample) / 8;
-    const byteRate = sampleRate * blockAlign;
-    const buffer = new ArrayBuffer(44);
-    const view = new DataView(buffer);
-    view.setUint8(0, 'R'.charCodeAt(0));
-    view.setUint8(1, 'I'.charCodeAt(0));
-    view.setUint8(2, 'F'.charCodeAt(0));
-    view.setUint8(3, 'F'.charCodeAt(0));
-    view.setUint32(4, 36 + dataLength, true);
-    view.setUint8(8, 'W'.charCodeAt(0));
-    view.setUint8(9, 'A'.charCodeAt(0));
-    view.setUint8(10, 'V'.charCodeAt(0));
-    view.setUint8(11, 'E'.charCodeAt(0));
-    view.setUint8(12, 'f'.charCodeAt(0));
-    view.setUint8(13, 'm'.charCodeAt(0));
-    view.setUint8(14, 't'.charCodeAt(0));
-    view.setUint8(15, ' '.charCodeAt(0));
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bitsPerSample, true);
-    view.setUint8(36, 'd'.charCodeAt(0));
-    view.setUint8(37, 'a'.charCodeAt(0));
-    view.setUint8(38, 't'.charCodeAt(0));
-    view.setUint8(39, 'a'.charCodeAt(0));
-    view.setUint32(40, dataLength, true);
-    return new Uint8Array(buffer);
-};
+// --- Free TTS Utility (Youdao Dictionary) ---
+// Guide provided by user: Use https://dict.youdao.com/dictvoice?audio=[text]&type=2
+function speakOne(item, onEnd) {
+    updateStatus("Requesting Audio (Youdao)...");
 
-// Base64 PCM -> WAV ArrayBuffer (Adapted from base64ToWavBlob)
-function base64ToWavArrayBuffer(base64, sampleRate = 24000) {
-    const binaryString = atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-    }
-    const wavHeader = createWavHeader(len, sampleRate, 1, 16);
-    const wavFile = new Uint8Array(wavHeader.length + len);
-    wavFile.set(wavHeader);
-    wavFile.set(bytes, wavHeader.length);
-    return wavFile.buffer;
-}
+    // 1. Create Youdao URL (type=2 is American English)
+    const url = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.text)}&type=2`;
 
-// ダイナミックモデル取得結果のキャッシュ
-let cachedGeminiModels = [];
+    // 2. Create Audio Object
+    const audio = new Audio(url);
+    STATE.currentAudioSource = audio;
+    audio.playbackRate = item.rate;
 
-async function fetchGoogleTTS(text, rate, isSilent = false) {
-    const apiKey = STATE.googleApiKey.trim();
-    if (!apiKey) return null;
-
-    // --- Dynamic Model Discovery (Reference: User Request) ---
-    if (cachedGeminiModels.length === 0) {
-        let candidatesFromApi = [];
-        try {
-            updateStatus("AIモデル一覧を取得中...");
-            const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-            const listRes = await fetch(listUrl);
-            if (!listRes.ok) throw new Error("モデル一覧の取得に失敗しました");
-
-            const listData = await listRes.json();
-            const models = listData.models || [];
-
-            // generateContentをサポートしているGeminiモデルを抽出
-            const availableModels = models.filter(m =>
-                m.supportedGenerationMethods &&
-                m.supportedGenerationMethods.includes("generateContent") &&
-                m.name.includes("gemini")
-            );
-
-            if (availableModels.length > 0) {
-                // モデル名を抽出 (models/gemini-pro -> gemini-pro)
-                let allNames = availableModels.map(m => m.name.replace("models/", ""));
-
-                // 優先順位付け whitelist
-                const ALLOWED_SERIES = [
-                    'gemini-1.5-pro', 'gemini-1.5-flash',
-                    'gemini-2.0-pro', 'gemini-2.0-flash',
-                    'gemini-2.5-pro', 'gemini-2.5-flash',
-                    'gemini-3.0-pro', 'gemini-3.0-flash',
-                    'gemini-3-pro', 'gemini-3-flash'
-                ];
-
-                allNames = allNames.filter(n => {
-                    // 絶対に除外すべき有害・課金・プレビュー特殊モデル
-                    if (n.includes('computer-use')) return false;
-                    if (n.includes('robotics')) return false;
-                    if (n.includes('image-generation')) return false;
-                    if (n.includes('image-preview')) return false;
-                    // TTSアプリなので 'tts' 除外はスキップ (ユーザーコードの意図とは異なるがアプリの性質を優先)
-                    // if (n.includes('tts')) return false; 
-
-                    // ホワイトリストチェック
-                    return ALLOWED_SERIES.some(series => n.includes(series));
-                });
-
-                allNames.sort((a, b) => {
-                    const getScore = (name) => {
-                        let score = 0;
-                        // 新しいバージョンほど優先
-                        if (name.includes("gemini-3")) score += 300;
-                        else if (name.includes("gemini-2.5")) score += 200;
-                        else if (name.includes("gemini-2.0")) score += 100;
-                        else if (name.includes("gemini-1.5")) score += 50;
-
-                        // Pro > Flash
-                        if (name.includes("pro")) score += 20;
-                        if (name.includes("flash")) score += 10;
-
-                        if (name.includes("latest")) score += 5;
-                        if (name.includes("exp")) score += 1;
-
-                        return score;
-                    };
-                    return getScore(b) - getScore(a);
-                });
-
-                candidatesFromApi = allNames;
-                console.log("Auto-discovered models:", candidatesFromApi);
-            }
-
-        } catch (e) {
-            console.warn("Model discovery failed, using fallback list:", e);
-        }
-
-        // モデル候補リスト構築
-        if (candidatesFromApi.length > 0) {
-            cachedGeminiModels = candidatesFromApi;
-        } else {
-            // Fallback
-            cachedGeminiModels = [
-                "gemini-2.5-flash-preview-tts",
-                "gemini-2.0-flash-exp",
-                "gemini-1.5-flash"
-            ];
-        }
-    }
-
-    const body = {
-        contents: [{ parts: [{ text: text }] }],
-        generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-                voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: "Aoede" }
-                }
-            }
-        }
+    // 3. Setup Listeners
+    audio.onended = () => {
+        updateStatus("Finished (Youdao)");
+        onEnd();
     };
 
-    // モデルを順番に試すループ
-    for (const model of cachedGeminiModels) {
-        // ユーザー要望: トライしているモデル名をリアルタイム表示
-        if (!isSilent) updateStatus(`Requesting: ${model}...`);
+    audio.onerror = (e) => {
+        console.warn("Youdao Audio Error:", e);
+        updateStatus("Audio Error. Fallback.");
+        fallbackSpeak(item, onEnd);
+    };
 
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                console.warn(`Gemini API Error (${model}):`, response.status);
-                // 失敗したら画面にも表示しつつ、次へ
-                if (!isSilent) updateStatus(`Error (${model}): ${response.status}. Trying next...`);
-                // UI更新のために少し待つ (オプション)
-                await new Promise(r => setTimeout(r, 500));
-                continue;
-            }
-
-            const data = await response.json();
-            const base64Audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-            if (!base64Audio) {
-                console.warn(`Gemini: No audio data in response from ${model}`);
-                continue;
-            }
-
-            if (!isSilent) updateStatus(`Playing (Gemini: ${model})`);
-            return base64Audio;
-
-        } catch (e) {
-            clearTimeout(timeoutId);
-            console.error(`Fetch Exception (${model}):`, e);
-            if (!isSilent) updateStatus(`Exception (${model}). Trying next...`);
-            continue;
-        }
-    }
-
-    // 全モデル失敗時
-    if (!isSilent) updateStatus("All Gemini models failed. Switching to Standard Voice.");
-    return null;
-}
-
-function playAudioData(base64Audio, rate, onEnd) {
-    if (!base64Audio) {
-        onEnd();
-        return;
-    }
-
-    // 1. AudioContext Playback (Primary)
-    if (STATE.audioContext) {
-        updateStatus("Decoding Gemini Audio...");
-        try {
-            const wavBuffer = base64ToWavArrayBuffer(base64Audio, 24000);
-            STATE.audioContext.decodeAudioData(wavBuffer).then(audioBuffer => {
-                const source = STATE.audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                STATE.currentAudioSource = source;
-                source.playbackRate.value = rate;
-                source.connect(STATE.audioContext.destination);
-                source.onended = () => {
-                    updateStatus("Finished (Gemini)");
-                    onEnd();
-                };
-                source.start(0);
-                updateStatus("Playing (Gemini API)");
-            }).catch(e => {
-                console.error("Decode Error:", e);
-                // Fallback inside promise
-                fallbackSpeak({ text: "Error decoding audio.", rate: rate }, onEnd);
-            });
-        } catch (decodeErr) {
-            console.error("Decode Setup Error:", decodeErr);
-            onEnd();
-        }
-    } else {
-        onEnd();
-    }
-}
-
-// プリロード機能
-function preloadRemainingQuestions() {
-    const pIndex = STATE.currentQuestionIndex;
-    const passage = STATE.playlist[pIndex];
-    if (!passage) return;
-
-    // 現在が0なら、1と2をプリロード
-    for (let i = 1; i < 3; i++) {
-        const target = STATE.currentPassageTargets[i];
-        if (!target) continue;
-        const cacheKey = `${pIndex}-${i}`;
-        if (STATE.audioCache[cacheKey]) continue;
-
-        const qText = `Question Number ${i + 1}. ... ${target.text}`;
-
-        console.log(`Preloading Q${i + 1}...`);
-        // Promiseを格納 (awaitしない)
-        STATE.audioCache[cacheKey] = fetchGoogleTTS(qText, STATE.speechRate, true);
-    }
-}
-
-
-
-function speakOne(item, onEnd) {
-    if (STATE.googleApiKey) {
-        updateStatus("Requesting Gemini Voice...");
-        fetchGoogleTTS(item.text, item.rate)
-            .then(async (audioContent) => { // audioContent is PCM Base64
-                // 1. AudioContext Playback (Primary)
-                if (audioContent && STATE.audioContext) {
-                    updateStatus("Decoding Gemini Audio...");
-                    try {
-                        const wavBuffer = base64ToWavArrayBuffer(audioContent, 24000); // Wrap PCM with WAV header
-                        const audioBuffer = await STATE.audioContext.decodeAudioData(wavBuffer);
-
-                        const source = STATE.audioContext.createBufferSource();
-                        source.buffer = audioBuffer;
-                        STATE.currentAudioSource = source; // Store for real-time speed control
-                        // Gemini doesn't support server-side rate yet, so we do it client-side
-                        source.playbackRate.value = item.rate;
-
-                        source.connect(STATE.audioContext.destination);
-
-                        source.onended = () => {
-                            updateStatus("Finished (Gemini)");
-                            onEnd();
-                        };
-
-                        source.start(0);
-                        updateStatus("Playing (Gemini API)");
-                    } catch (decodeErr) {
-                        console.error("Decode Error:", decodeErr);
-                        updateStatus("Decode Failed. Fallback.");
-                        fallbackSpeak(item, onEnd);
-                    }
-                }
-                // 2. Generic Audio Element Fallback (Secondary)
-                else if (audioContent) {
-                    updateStatus("Fallback to Audio Element...");
-                    // Create Blob from WAV buffer
-                    const wavBuffer = base64ToWavArrayBuffer(audioContent, 24000);
-                    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-                    const url = URL.createObjectURL(blob);
-
-                    const audio = new Audio(url);
-                    STATE.currentAudioSource = audio; // Store for real-time speed control
-                    audio.playbackRate = item.rate; // Client-side speed
-
-                    audio.onended = () => {
-                        updateStatus("Finished (Gemini)");
-                        URL.revokeObjectURL(url);
-                        onEnd();
-                    };
-                    audio.onerror = (e) => {
-                        updateStatus("Playback Error. Fallback.");
-                        URL.revokeObjectURL(url);
-                        fallbackSpeak(item, onEnd);
-                    };
-
-                    const playPromise = audio.play();
-                    if (playPromise !== undefined) {
-                        playPromise
-                            .then(() => updateStatus("Playing (Gemini Via Element)"))
-                            .catch(e => {
-                                updateStatus("Autoplay Blocked. Fallback.");
-                                fallbackSpeak(item, onEnd);
-                            });
-                    }
-                } else {
-                    setTimeout(() => fallbackSpeak(item, onEnd), 200);
-                }
-            })
-            .catch(e => {
-                updateStatus("Critical Error. Fallback.");
+    // 4. Attempt Playback
+    const playPromise = audio.play();
+    if (playPromise !== undefined) {
+        playPromise
+            .then(() => updateStatus("Playing (Youdao)"))
+            .catch(error => {
+                console.warn("Youdao Playback Failed:", error);
+                updateStatus("Playback Failed. Fallback.");
                 fallbackSpeak(item, onEnd);
             });
-    } else {
-        fallbackSpeak(item, onEnd);
     }
 }
 
@@ -498,7 +188,6 @@ async function initGame() {
         STATE.history = [];
         STATE.isAnswered = false;
         STATE.paused = false;
-        STATE.audioCache = {}; // Clear Cache
 
         // シャッフルして2問だけ選ぶ（1ゲーム2パッセージ = 6問）
         const pool = window.PASSAGES;
@@ -516,34 +205,19 @@ async function initGame() {
 function goToTitle() {
     window.speechSynthesis.cancel();
     STATE.isTutorialOpen = false;
-    STATE.isSettingsOpen = false;
     showTitleScreen();
 }
 
 function toggleTutorial() {
     STATE.isTutorialOpen = !STATE.isTutorialOpen;
-    if (STATE.isTutorialOpen) STATE.isSettingsOpen = false; // 排他制御
+    // if (STATE.isTutorialOpen) STATE.isSettingsOpen = false; // logic removed
     if (!STATE.isTutorialOpen && !localStorage.getItem('english_ear_tutorial_done')) {
         localStorage.setItem('english_ear_tutorial_done', 'true');
     }
     showTitleScreen();
 }
 
-function toggleSettings() {
-    STATE.isSettingsOpen = !STATE.isSettingsOpen;
-    if (STATE.isSettingsOpen) STATE.isTutorialOpen = false; // 排他制御
-    showTitleScreen();
-}
-
-function saveSettings() {
-    const input = document.getElementById('apiKeyInput');
-    if (input) {
-        const key = input.value.trim();
-        STATE.googleApiKey = key;
-        localStorage.setItem('english_ear_google_api_key', key);
-    }
-    toggleSettings();
-}
+// Settings functions removed (toggleSettings, saveSettings)
 
 function togglePause() {
     STATE.paused = !STATE.paused;
@@ -592,63 +266,36 @@ function nextQuestion() {
     playPassageSequence(passage, target);
 }
 
-async function playPassageSequence(passage, target) {
+function playPassageSequence(passage, target) {
     if (STATE.paused) return;
     window.speechSynthesis.cancel();
 
-    // キャッシュキー
-    const cacheKey = `${STATE.currentQuestionIndex}-${STATE.subQuestionIndex}`;
+    let sequence = [];
 
-    let audioData = null;
-    let textForFallback = "";
-
-    // テキスト構築
+    // 全文読み上げは各パッセージの最初の問題のみ
     if (STATE.subQuestionIndex === 0) {
+        // パッセージ + 質問をまとめて1回のリクエストにする (安定化のため)
+        // Question Numberの前に無音区間を作るためにピリオド等を多めに入れる
         const fullPassageText = passage.sentences.map(s => s.text).join(' ');
         const questionText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
-        // しっかり間を入れる
-        textForFallback = `${fullPassageText} ...... ${questionText}`;
 
-        // ★ここで次の問題(Q2, Q3)のプリロードをキックする
-        preloadRemainingQuestions();
-    } else {
-        textForFallback = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
-    }
-
-    // キャッシュチェック
-    if (STATE.audioCache && STATE.audioCache[cacheKey]) {
-        updateStatus("Using cached audio...");
-        try {
-            audioData = await STATE.audioCache[cacheKey];
-        } catch (e) {
-            console.warn("Cache retrieval failed:", e);
-            audioData = null;
-        }
-    }
-
-    // なければ生成 (キャッシュなし、またはキャッシュ呼び出し失敗時)
-    if (!audioData) {
-        // キャッシュに保存しつつ取得
-        const promise = fetchGoogleTTS(textForFallback, STATE.speechRate);
-        STATE.audioCache[cacheKey] = promise;
-        audioData = await promise;
-    }
-
-    if (audioData) {
-        playAudioData(audioData, STATE.speechRate, () => {
-            STATE.isReading = false;
-            renderGameContent();
+        // 結合して1つの音声としてリクエスト
+        sequence.push({
+            text: `${fullPassageText} ...... ${questionText}`,
+            rate: STATE.speechRate
         });
     } else {
-        // Fallback to WebSpeech API
-        fallbackSpeak({ text: textForFallback, rate: STATE.speechRate }, () => {
-            STATE.isReading = false;
-            renderGameContent();
-        });
+        // 2問目以降は質問のみ (これも一回で)
+        const qText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
+        sequence.push({ text: qText, rate: STATE.speechRate });
     }
+
+    // 古い定義を削除
+    // sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: 1.0, delay: 1000 });
+    // sequence.push({ text: target.text, rate: STATE.speechRate, delay: 500, isTarget: true });
+
+    speakRecursive(sequence, 0);
 }
-
-
 
 function speakRecursive(sequence, index) {
     if (STATE.paused) return;
@@ -696,10 +343,17 @@ function handleAnswer(sentenceId) {
 
 function replayVoice() {
     if (STATE.isReading || STATE.paused) return;
-    const u = new SpeechSynthesisUtterance(STATE.currentQuestion.target.text);
-    u.lang = 'en-US';
-    u.rate = STATE.speechRate;
-    window.speechSynthesis.speak(u);
+
+    // Use speakOne to leverage Gemini TTS if available
+    STATE.isReading = true;
+    speakOne({
+        text: STATE.currentQuestion.target.text,
+        rate: STATE.speechRate
+    }, () => {
+        STATE.isReading = false;
+        // On replay finish, we don't need to do anything specific other than unlocking reading state
+        renderGameContent();
+    });
 }
 
 function finishGame() {
@@ -724,11 +378,6 @@ function showTitleScreen() {
                 <i data-lucide="crown" class="w-64 h-64 mx-auto text-white"></i>
             </div>
 
-            <!-- Settings Button -->
-            <button onclick="toggleSettings()" class="absolute top-4 left-4 p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors z-20">
-                <i data-lucide="settings" class="w-6 h-6 text-slate-300"></i>
-            </button>
-
             <!-- Help Button -->
             <button onclick="toggleTutorial()" class="absolute top-4 right-4 p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors z-20">
                 <i data-lucide="help-circle" class="w-6 h-6 text-slate-300"></i>
@@ -739,13 +388,6 @@ function showTitleScreen() {
             </div>
             <h1 class="text-4xl font-black mb-2 tracking-tight z-10 drop-shadow-lg">英検4級<br>Basic Listening</h1>
             <p class="text-slate-400 mb-8 text-lg z-10">Hearing & Reading Quest</p>
-            
-            <!-- API Status Badge -->
-            ${STATE.googleApiKey ? `
-                <div class="mb-4 z-10 inline-flex items-center gap-1 px-3 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-mono">
-                    <i data-lucide="sparkles" class="w-3 h-3"></i> Gemini AI Voice Active
-                </div>
-            ` : ''}
             
             <!-- Rank Card -->
             <div class="w-full max-w-xs bg-slate-800/80 backdrop-blur border border-slate-600 rounded-2xl p-4 mb-4 z-10 shadow-xl">
@@ -766,13 +408,13 @@ function showTitleScreen() {
                     <span class="text-xs text-slate-400 font-bold uppercase tracking-widest">Rate</span>
                     <div class="flex items-center gap-4">
                         <button onclick="changeSpeed(-0.1)" class="p-1 text-slate-400 hover:text-white rounded-full hover:bg-slate-700 transition-colors active:scale-90">
-                            <i data-lucide="minus" class="w-4 h-4"></i>
+                             <i data-lucide="minus" class="w-4 h-4"></i>
                         </button>
                         <div id="rate-label" class="text-base font-black font-mono text-emerald-400 w-12 text-center tabular-nums">
                             ${STATE.speechRate.toFixed(1)}x
                         </div>
                         <button onclick="changeSpeed(0.1)" class="p-1 text-slate-400 hover:text-white rounded-full hover:bg-slate-700 transition-colors active:scale-90">
-                            <i data-lucide="plus" class="w-4 h-4"></i>
+                             <i data-lucide="plus" class="w-4 h-4"></i>
                         </button>
                     </div>
                  </div>
@@ -783,52 +425,6 @@ function showTitleScreen() {
                 Start Mission
             </button>
             <p class="mt-4 text-xs text-slate-500">2 Passages • 6 Questions</p>
-
-            <!-- Settings Modal -->
-            ${STATE.isSettingsOpen ? `
-            <div class="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
-                <div class="bg-slate-800 border border-slate-600 rounded-3xl p-6 w-full max-w-sm shadow-2xl relative overflow-hidden">
-                    <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-purple-500 to-pink-500"></div>
-                    
-                    <h2 class="text-xl font-bold mb-4 flex items-center gap-2 text-white">
-                        <i data-lucide="settings" class="w-5 h-5 text-purple-400"></i>
-                        Voice Settings
-                    </h2>
-
-                    <div class="mb-6">
-                        <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Google Cloud API Key</label>
-                        <input type="text" id="apiKeyInput" value="${STATE.googleApiKey}" placeholder="Paste API Key here..." 
-                            class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-500 transition-colors font-mono">
-                        <div class="text-[10px] text-slate-400 mt-3 bg-slate-900/50 p-3 rounded-lg border border-slate-700">
-                            <div class="font-bold text-slate-300 mb-1">APIキーの入手手順:</div>
-                            <ol class="list-decimal list-inside space-y-1 ml-1 text-slate-500">
-                                <li>
-                                    <a href="https://aistudio.google.com/app/api-keys" target="_blank" class="text-purple-400 hover:text-purple-300 underline inline-flex items-center gap-1 font-bold">
-                                        Google AI Studio <i data-lucide="external-link" class="w-3 h-3"></i>
-                                    </a>
-                                    へアクセス
-                                </li>
-                                <li>「Create API key」をクリック</li>
-                                <li>作成されたキーをコピーしてここに入力</li>
-                            </ol>
-                            <div class="mt-2 pt-2 border-t border-slate-700/50 text-[10px] text-emerald-400/80 flex items-center gap-1">
-                                <i data-lucide="check-circle-2" class="w-3 h-3"></i>
-                                <span>高品質な音声読み上げが有効になります</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="flex gap-3">
-                        <button onclick="toggleSettings()" class="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-300 font-bold py-3 rounded-xl transition-colors">
-                            Cancel
-                        </button>
-                        <button onclick="saveSettings()" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 rounded-xl transition-colors shadow-lg shadow-purple-600/20">
-                            Save
-                        </button>
-                    </div>
-                </div>
-            </div>
-            ` : ''}
 
             <!-- Tutorial Modal -->
             ${STATE.isTutorialOpen ? `
