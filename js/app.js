@@ -78,65 +78,76 @@ function updateStatus(msg) {
     if (el) el.innerHTML = msg; // リンクを表示可能にするためHTMLとして設定
 }
 
-// --- Free TTS Utility (Youdao Dictionary) ---
-// Guide provided by user: Use https://dict.youdao.com/dictvoice?audio=[text]&type=2
-function speakOne(item, onEnd) {
-    updateStatus("Requesting Audio (Youdao)...");
+// --- Optimized System TTS Utility ---
+let cachedVoice = null;
 
-    const url = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.text)}&type=2`;
-
-    // Create and configure Audio
-    const audio = new Audio(url);
-    audio.preload = 'auto'; // Hint to load immediately
-    STATE.currentAudioSource = audio;
-    audio.playbackRate = item.rate;
-
-    // Listeners
-    audio.onended = () => {
-        updateStatus("Finished (Youdao)");
-        onEnd();
+// Initialize voices (necessary for some browsers)
+if (window.speechSynthesis) {
+    window.speechSynthesis.onvoiceschanged = () => {
+        console.log("Voices loaded");
+        getBestVoice(); // Pre-cache
     };
-
-    // Playback
-    // audio.load() can sometimes help reset state on some browsers
-    audio.load();
-
-    let hasError = false; // Guard against double-firing (onerror + catch)
-
-    const handleError = (e) => {
-        if (hasError) return;
-        hasError = true;
-        console.warn("Youdao Playback Failed:", e);
-        updateStatus("Playback Failed. Fallback.");
-        fallbackSpeak(item, onEnd);
-    };
-
-    audio.onerror = (e) => handleError(e);
-
-    const playPromise = audio.play();
-    if (playPromise !== undefined) {
-        playPromise
-            .then(() => updateStatus("Playing (Youdao)"))
-            .catch(error => handleError(error));
-    }
 }
 
-function fallbackSpeak(item, onEnd) {
+function getBestVoice() {
+    if (cachedVoice) return cachedVoice;
+
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length === 0) return null;
+
+    // Priority list for English voices
+    const priorities = [
+        name => name.includes("Google US English"),           // Chrome High Quality
+        name => name.includes("Microsoft") && name.includes("Natural") && name.includes("English"), // Edge Natural
+        name => name.includes("Google") && name.includes("English"),
+        name => name.includes("en-US")
+    ];
+
+    for (const check of priorities) {
+        const found = voices.find(v => check(v.name));
+        if (found) {
+            console.log("Selected Voice:", found.name);
+            cachedVoice = found;
+            return found;
+        }
+    }
+
+    // Fallback to first English voice
+    const fallback = voices.find(v => v.lang.startsWith('en'));
+    cachedVoice = fallback || voices[0];
+    return cachedVoice;
+}
+
+function speakOne(item, onEnd) {
+    updateStatus("Reading (System)...");
+
     if (!window.speechSynthesis) {
+        console.error("TTS not supported");
         onEnd();
         return;
     }
-    // NOT canceling here prevents cutting off previous sequence items if timing is tight.
-    // window.speechSynthesis.cancel(); 
 
     const u = new SpeechSynthesisUtterance(item.text);
-    u.lang = 'en-US';
+    const voice = getBestVoice();
+    if (voice) u.voice = voice;
+
+    u.lang = 'en-US'; // Fallback lang
     u.rate = item.rate;
-    u.onend = onEnd;
-    u.onerror = (e) => {
-        console.error("System TTS Error:", e);
-        onEnd(); // Ensure chain continues even on error
+
+    // Some browsers have stability issues with onend if the speech is too long or interrupted
+    // But for short sentences, it's usually fine.
+    u.onend = () => {
+        updateStatus("Finished (System)");
+        onEnd();
     };
+
+    u.onerror = (e) => {
+        console.warn("TTS Error:", e);
+        updateStatus("Error (System)");
+        // Continue sequence even on error
+        onEnd();
+    };
+
     window.speechSynthesis.speak(u);
 }
 
