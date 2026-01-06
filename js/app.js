@@ -19,7 +19,8 @@ const STATE = {
     isSettingsOpen: false,
     isSettingsOpen: false,
     statusMessage: '', // 音声再生状況のデバッグ表示用
-    audioContext: null // Web Audio API用コンテキスト
+    audioContext: null, // Web Audio API用コンテキスト
+    audioCache: {} // { "passageIndex-subIndex": Promise<base64> }
 };
 
 // Rank System
@@ -129,16 +130,99 @@ function base64ToWavArrayBuffer(base64, sampleRate = 24000) {
     return wavFile.buffer;
 }
 
-// 試行するモデルのリスト (成功アプリの実績重視)
-const GEMINI_MODELS = [
-    "gemini-2.5-flash-preview-tts", // Exact name from successful app
-    "gemini-2.0-flash-exp",         // Backup
-    "gemini-1.5-flash"              // Backup
-];
+// ダイナミックモデル取得結果のキャッシュ
+let cachedGeminiModels = [];
 
-async function fetchGoogleTTS(text, rate) {
+async function fetchGoogleTTS(text, rate, isSilent = false) {
     const apiKey = STATE.googleApiKey.trim();
     if (!apiKey) return null;
+
+    // --- Dynamic Model Discovery (Reference: User Request) ---
+    if (cachedGeminiModels.length === 0) {
+        let candidatesFromApi = [];
+        try {
+            updateStatus("AIモデル一覧を取得中...");
+            const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+            const listRes = await fetch(listUrl);
+            if (!listRes.ok) throw new Error("モデル一覧の取得に失敗しました");
+
+            const listData = await listRes.json();
+            const models = listData.models || [];
+
+            // generateContentをサポートしているGeminiモデルを抽出
+            const availableModels = models.filter(m =>
+                m.supportedGenerationMethods &&
+                m.supportedGenerationMethods.includes("generateContent") &&
+                m.name.includes("gemini")
+            );
+
+            if (availableModels.length > 0) {
+                // モデル名を抽出 (models/gemini-pro -> gemini-pro)
+                let allNames = availableModels.map(m => m.name.replace("models/", ""));
+
+                // 優先順位付け whitelist
+                const ALLOWED_SERIES = [
+                    'gemini-1.5-pro', 'gemini-1.5-flash',
+                    'gemini-2.0-pro', 'gemini-2.0-flash',
+                    'gemini-2.5-pro', 'gemini-2.5-flash',
+                    'gemini-3.0-pro', 'gemini-3.0-flash',
+                    'gemini-3-pro', 'gemini-3-flash'
+                ];
+
+                allNames = allNames.filter(n => {
+                    // 絶対に除外すべき有害・課金・プレビュー特殊モデル
+                    if (n.includes('computer-use')) return false;
+                    if (n.includes('robotics')) return false;
+                    if (n.includes('image-generation')) return false;
+                    if (n.includes('image-preview')) return false;
+                    // TTSアプリなので 'tts' 除外はスキップ (ユーザーコードの意図とは異なるがアプリの性質を優先)
+                    // if (n.includes('tts')) return false; 
+
+                    // ホワイトリストチェック
+                    return ALLOWED_SERIES.some(series => n.includes(series));
+                });
+
+                allNames.sort((a, b) => {
+                    const getScore = (name) => {
+                        let score = 0;
+                        // 新しいバージョンほど優先
+                        if (name.includes("gemini-3")) score += 300;
+                        else if (name.includes("gemini-2.5")) score += 200;
+                        else if (name.includes("gemini-2.0")) score += 100;
+                        else if (name.includes("gemini-1.5")) score += 50;
+
+                        // Pro > Flash
+                        if (name.includes("pro")) score += 20;
+                        if (name.includes("flash")) score += 10;
+
+                        if (name.includes("latest")) score += 5;
+                        if (name.includes("exp")) score += 1;
+
+                        return score;
+                    };
+                    return getScore(b) - getScore(a);
+                });
+
+                candidatesFromApi = allNames;
+                console.log("Auto-discovered models:", candidatesFromApi);
+            }
+
+        } catch (e) {
+            console.warn("Model discovery failed, using fallback list:", e);
+        }
+
+        // モデル候補リスト構築
+        if (candidatesFromApi.length > 0) {
+            cachedGeminiModels = candidatesFromApi;
+        } else {
+            // Fallback
+            cachedGeminiModels = [
+                "gemini-2.5-flash-preview-tts",
+                "gemini-2.0-flash-exp",
+                "gemini-1.5-flash"
+            ];
+        }
+    }
 
     const body = {
         contents: [{ parts: [{ text: text }] }],
@@ -153,9 +237,9 @@ async function fetchGoogleTTS(text, rate) {
     };
 
     // モデルを順番に試すループ
-    for (const model of GEMINI_MODELS) {
+    for (const model of cachedGeminiModels) {
         // ユーザー要望: トライしているモデル名をリアルタイム表示
-        updateStatus(`Requesting: ${model}...`);
+        if (!isSilent) updateStatus(`Requesting: ${model}...`);
 
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
@@ -174,7 +258,7 @@ async function fetchGoogleTTS(text, rate) {
             if (!response.ok) {
                 console.warn(`Gemini API Error (${model}):`, response.status);
                 // 失敗したら画面にも表示しつつ、次へ
-                updateStatus(`Error (${model}): ${response.status}. Trying next...`);
+                if (!isSilent) updateStatus(`Error (${model}): ${response.status}. Trying next...`);
                 // UI更新のために少し待つ (オプション)
                 await new Promise(r => setTimeout(r, 500));
                 continue;
@@ -188,20 +272,78 @@ async function fetchGoogleTTS(text, rate) {
                 continue;
             }
 
-            updateStatus(`Playing (Gemini: ${model})`);
+            if (!isSilent) updateStatus(`Playing (Gemini: ${model})`);
             return base64Audio;
 
         } catch (e) {
             clearTimeout(timeoutId);
             console.error(`Fetch Exception (${model}):`, e);
-            updateStatus(`Exception (${model}). Trying next...`);
+            if (!isSilent) updateStatus(`Exception (${model}). Trying next...`);
             continue;
         }
     }
 
     // 全モデル失敗時
-    updateStatus("All Gemini models failed. Switching to Standard Voice.");
+    if (!isSilent) updateStatus("All Gemini models failed. Switching to Standard Voice.");
     return null;
+}
+
+function playAudioData(base64Audio, rate, onEnd) {
+    if (!base64Audio) {
+        onEnd();
+        return;
+    }
+
+    // 1. AudioContext Playback (Primary)
+    if (STATE.audioContext) {
+        updateStatus("Decoding Gemini Audio...");
+        try {
+            const wavBuffer = base64ToWavArrayBuffer(base64Audio, 24000);
+            STATE.audioContext.decodeAudioData(wavBuffer).then(audioBuffer => {
+                const source = STATE.audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                STATE.currentAudioSource = source;
+                source.playbackRate.value = rate;
+                source.connect(STATE.audioContext.destination);
+                source.onended = () => {
+                    updateStatus("Finished (Gemini)");
+                    onEnd();
+                };
+                source.start(0);
+                updateStatus("Playing (Gemini API)");
+            }).catch(e => {
+                console.error("Decode Error:", e);
+                // Fallback inside promise
+                fallbackSpeak({ text: "Error decoding audio.", rate: rate }, onEnd);
+            });
+        } catch (decodeErr) {
+            console.error("Decode Setup Error:", decodeErr);
+            onEnd();
+        }
+    } else {
+        onEnd();
+    }
+}
+
+// プリロード機能
+function preloadRemainingQuestions() {
+    const pIndex = STATE.currentQuestionIndex;
+    const passage = STATE.playlist[pIndex];
+    if (!passage) return;
+
+    // 現在が0なら、1と2をプリロード
+    for (let i = 1; i < 3; i++) {
+        const target = STATE.currentPassageTargets[i];
+        if (!target) continue;
+        const cacheKey = `${pIndex}-${i}`;
+        if (STATE.audioCache[cacheKey]) continue;
+
+        const qText = `Question Number ${i + 1}. ... ${target.text}`;
+
+        console.log(`Preloading Q${i + 1}...`);
+        // Promiseを格納 (awaitしない)
+        STATE.audioCache[cacheKey] = fetchGoogleTTS(qText, STATE.speechRate, true);
+    }
 }
 
 
@@ -356,6 +498,7 @@ async function initGame() {
         STATE.history = [];
         STATE.isAnswered = false;
         STATE.paused = false;
+        STATE.audioCache = {}; // Clear Cache
 
         // シャッフルして2問だけ選ぶ（1ゲーム2パッセージ = 6問）
         const pool = window.PASSAGES;
@@ -449,36 +592,63 @@ function nextQuestion() {
     playPassageSequence(passage, target);
 }
 
-function playPassageSequence(passage, target) {
+async function playPassageSequence(passage, target) {
     if (STATE.paused) return;
     window.speechSynthesis.cancel();
 
-    let sequence = [];
+    // キャッシュキー
+    const cacheKey = `${STATE.currentQuestionIndex}-${STATE.subQuestionIndex}`;
 
-    // 全文読み上げは各パッセージの最初の問題のみ
+    let audioData = null;
+    let textForFallback = "";
+
+    // テキスト構築
     if (STATE.subQuestionIndex === 0) {
-        // パッセージ + 質問をまとめて1回のリクエストにする (安定化のため)
-        // Question Numberの前に無音区間を作るためにピリオド等を多めに入れる
         const fullPassageText = passage.sentences.map(s => s.text).join(' ');
         const questionText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
+        // しっかり間を入れる
+        textForFallback = `${fullPassageText} ...... ${questionText}`;
 
-        // 結合して1つの音声としてリクエスト
-        sequence.push({
-            text: `${fullPassageText} ...... ${questionText}`,
-            rate: STATE.speechRate
-        });
+        // ★ここで次の問題(Q2, Q3)のプリロードをキックする
+        preloadRemainingQuestions();
     } else {
-        // 2問目以降は質問のみ (これも一回で)
-        const qText = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
-        sequence.push({ text: qText, rate: STATE.speechRate });
+        textForFallback = `Question Number ${STATE.subQuestionIndex + 1}. ... ${target.text}`;
     }
 
-    // 古い定義を削除
-    // sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: 1.0, delay: 1000 });
-    // sequence.push({ text: target.text, rate: STATE.speechRate, delay: 500, isTarget: true });
+    // キャッシュチェック
+    if (STATE.audioCache && STATE.audioCache[cacheKey]) {
+        updateStatus("Using cached audio...");
+        try {
+            audioData = await STATE.audioCache[cacheKey];
+        } catch (e) {
+            console.warn("Cache retrieval failed:", e);
+            audioData = null;
+        }
+    }
 
-    speakRecursive(sequence, 0);
+    // なければ生成 (キャッシュなし、またはキャッシュ呼び出し失敗時)
+    if (!audioData) {
+        // キャッシュに保存しつつ取得
+        const promise = fetchGoogleTTS(textForFallback, STATE.speechRate);
+        STATE.audioCache[cacheKey] = promise;
+        audioData = await promise;
+    }
+
+    if (audioData) {
+        playAudioData(audioData, STATE.speechRate, () => {
+            STATE.isReading = false;
+            renderGameContent();
+        });
+    } else {
+        // Fallback to WebSpeech API
+        fallbackSpeak({ text: textForFallback, rate: STATE.speechRate }, () => {
+            STATE.isReading = false;
+            renderGameContent();
+        });
+    }
 }
+
+
 
 function speakRecursive(sequence, index) {
     if (STATE.paused) return;
