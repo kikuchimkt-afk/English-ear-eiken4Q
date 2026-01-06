@@ -83,36 +83,41 @@ function updateStatus(msg) {
 function speakOne(item, onEnd) {
     updateStatus("Requesting Audio (Youdao)...");
 
-    // 1. Create Youdao URL (type=2 is American English)
     const url = `https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(item.text)}&type=2`;
 
-    // 2. Create Audio Object
+    // Create and configure Audio
     const audio = new Audio(url);
+    audio.preload = 'auto'; // Hint to load immediately
     STATE.currentAudioSource = audio;
     audio.playbackRate = item.rate;
 
-    // 3. Setup Listeners
+    // Listeners
     audio.onended = () => {
         updateStatus("Finished (Youdao)");
         onEnd();
     };
 
-    audio.onerror = (e) => {
-        console.warn("Youdao Audio Error:", e);
-        updateStatus("Audio Error. Fallback.");
+    // Playback
+    // audio.load() can sometimes help reset state on some browsers
+    audio.load();
+
+    let hasError = false; // Guard against double-firing (onerror + catch)
+
+    const handleError = (e) => {
+        if (hasError) return;
+        hasError = true;
+        console.warn("Youdao Playback Failed:", e);
+        updateStatus("Playback Failed. Fallback.");
         fallbackSpeak(item, onEnd);
     };
 
-    // 4. Attempt Playback
+    audio.onerror = (e) => handleError(e);
+
     const playPromise = audio.play();
     if (playPromise !== undefined) {
         playPromise
             .then(() => updateStatus("Playing (Youdao)"))
-            .catch(error => {
-                console.warn("Youdao Playback Failed:", error);
-                updateStatus("Playback Failed. Fallback.");
-                fallbackSpeak(item, onEnd);
-            });
+            .catch(error => handleError(error));
     }
 }
 
@@ -121,11 +126,17 @@ function fallbackSpeak(item, onEnd) {
         onEnd();
         return;
     }
-    window.speechSynthesis.cancel();
+    // NOT canceling here prevents cutting off previous sequence items if timing is tight.
+    // window.speechSynthesis.cancel(); 
+
     const u = new SpeechSynthesisUtterance(item.text);
     u.lang = 'en-US';
     u.rate = item.rate;
     u.onend = onEnd;
+    u.onerror = (e) => {
+        console.error("System TTS Error:", e);
+        onEnd(); // Ensure chain continues even on error
+    };
     window.speechSynthesis.speak(u);
 }
 
@@ -274,47 +285,21 @@ function playPassageSequence(passage, target) {
 
     // 全文読み上げは各パッセージの最初の問題のみ
     if (STATE.subQuestionIndex === 0) {
-        // APIの文字数制限（Youdao等は短文向け）を回避するため、
-        // 1文ずつキューに追加して再生するスタイルに変更
-
-        // 1. Title (Optional, skipping for now to keep it simple or add if needed)
-        // sequence.push({ text: passage.title, rate: STATE.speechRate });
-
-        // 2. Sentences
-        passage.sentences.forEach((s, index) => {
-            sequence.push({
-                text: s.text,
-                rate: STATE.speechRate,
-                delay: index === 0 ? 500 : 800 // 最初の文は500ms, 以降は少し間隔をあける
-            });
+        // 1. Sentences
+        passage.sentences.forEach((s) => {
+            sequence.push({ text: s.text, rate: STATE.speechRate });
         });
 
         // 3. Question Transition
-        sequence.push({
-            text: `Question Number ${STATE.subQuestionIndex + 1}.`,
-            rate: STATE.speechRate,
-            delay: 1500 // パッセージと質問の間に長めのポーズ
-        });
+        sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: STATE.speechRate });
 
         // 4. Question Target
-        sequence.push({
-            text: target.text,
-            rate: STATE.speechRate,
-            delay: 1000
-        });
+        sequence.push({ text: target.text, rate: STATE.speechRate });
 
     } else {
         // 2問目以降は質問のみ
-        sequence.push({
-            text: `Question Number ${STATE.subQuestionIndex + 1}.`,
-            rate: STATE.speechRate,
-            delay: 500
-        });
-        sequence.push({
-            text: target.text,
-            rate: STATE.speechRate,
-            delay: 1000
-        });
+        sequence.push({ text: `Question Number ${STATE.subQuestionIndex + 1}.`, rate: STATE.speechRate });
+        sequence.push({ text: target.text, rate: STATE.speechRate });
     }
 
     speakRecursive(sequence, 0);
@@ -330,11 +315,8 @@ function speakRecursive(sequence, index) {
     const item = sequence[index];
     const nextStep = () => speakRecursive(sequence, index + 1);
 
-    if (item.delay) {
-        setTimeout(() => { if (!STATE.paused) speakOne(item, nextStep); }, item.delay);
-    } else {
-        speakOne(item, nextStep);
-    }
+    // No delays to prevent Autoplay blocking
+    speakOne(item, nextStep);
 }
 
 function handleAnswer(sentenceId) {
